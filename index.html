@@ -1821,7 +1821,13 @@ body:not(.sidebar-open) .sidebar {
       els.fitWidth.addEventListener("click", () => setFitMode("fit-width"));
     }
     if (els.fitPage) {
-      els.fitPage.addEventListener("click", () => setFitMode("fit-page"));
+      els.fitPage.addEventListener("click", () => {
+        if (document.body.classList.contains("sidebar-open")) {
+          setSidebarOpen(false);
+          return;
+        }
+        setFitMode("fit-page");
+      });
     }
 
     els.searchInput.addEventListener("keydown", (event) => {
@@ -1879,13 +1885,12 @@ body:not(.sidebar-open) .sidebar {
     els.viewer.addEventListener(
       "wheel",
       (event) => {
-        if (event.deltaY === 0) {
+        const zoomDelta = getWheelZoomDelta(event);
+        if (!zoomDelta) {
           return;
         }
         event.preventDefault();
-        const direction = event.deltaY > 0 ? -1 : 1;
-        const step = event.shiftKey ? 0.2 : 0.1;
-        zoomAtPoint(direction * step, event.clientX, event.clientY);
+        zoomAtPoint(zoomDelta, event.clientX, event.clientY);
       },
       { passive: false }
     );
@@ -4299,11 +4304,22 @@ function fitBookGridTitles() {
   }
 
   function resolvePath(relativePath) {
+    const raw = String(relativePath || "");
+    const normalizedRaw = normalizeFilePath(raw);
     if (!state.basePath) {
-      return relativePath;
+      return normalizedRaw || raw;
     }
     const base = state.basePath.replace(REGEX.trailingSlash, "");
-    return `${base}/${relativePath}`;
+    const normalizedBase = normalizeFilePath(base);
+    const rawLower = normalizedRaw.toLowerCase();
+    const baseLower = normalizedBase.toLowerCase();
+    if (
+      rawLower === baseLower ||
+      rawLower.startsWith(`${baseLower}/`)
+    ) {
+      return normalizedRaw;
+    }
+    return `${base}/${normalizedRaw || raw}`;
   }
 
   async function fetchJson(path) {
@@ -7985,13 +8001,39 @@ function fitBookGridTitles() {
       if (!rawUrl) {
         return "";
       }
-      if (!REGEX.httpProtocol.test(rawUrl)) {
-        const localRef = normalizeLocalMaterialReference(rawUrl);
-        if (localRef && !hasLocalMaterialTarget(localRef)) {
-          return "";
-        }
+      if (
+        REGEX.httpProtocol.test(rawUrl) ||
+        rawUrl.startsWith("//") ||
+        (hasNonFileUrlScheme(rawUrl) && !REGEX.fileProtocol.test(rawUrl))
+      ) {
+        return appendPdfPageTarget(rawUrl, entry);
       }
-      return appendPdfPageTarget(rawUrl, entry);
+      if (
+        REGEX.fileProtocol.test(rawUrl) ||
+        /^[a-z]:[\\/]/i.test(rawUrl) ||
+        rawUrl.startsWith("#") ||
+        rawUrl.startsWith("?")
+      ) {
+        return appendPdfPageTarget(rawUrl, entry);
+      }
+      let path = rawUrl;
+      if (state.bookFormat === "structured") {
+        path = resolveStructuredMaterialLink(path);
+      }
+      const checkPath = normalizeLocalMaterialReference(path);
+      if (checkPath && !hasLocalMaterialTarget(checkPath)) {
+        return "";
+      }
+      const normalizedPath = normalizeFilePath(path);
+      if (!normalizedPath) {
+        return appendPdfPageTarget(rawUrl, entry);
+      }
+      const resolved = resolveResourcePath(normalizedPath);
+      if (shouldPreferDirectMaterialPath(normalizedPath)) {
+        return appendPdfPageTarget(resolved || rawUrl, entry);
+      }
+      const url = getResourceUrl(normalizedPath, { allowMedia: true });
+      return appendPdfPageTarget(url || resolved || rawUrl, entry);
     }
     if (entry.path) {
       let path = entry.path;
@@ -8083,6 +8125,15 @@ function fitBookGridTitles() {
     if (!normalized) {
       return "";
     }
+    const appRelativeMatch = normalized.match(/^app\.html([?#].*)?$/i);
+    if (appRelativeMatch) {
+      const page = parseMaterialPageFromPath(normalized);
+      const pkg = findStructuredMediaPackageForPage(page);
+      if (pkg) {
+        const suffix = appRelativeMatch[1] || "";
+        return `content/media/${pkg}/app.html${suffix}`;
+      }
+    }
     const pageMatch = normalized.match(
       /^content\/media\/([^/]+)\/content\/pages\/page_(\d+)\//i
     );
@@ -8096,6 +8147,47 @@ function fitBookGridTitles() {
       return `content/media/${pagesRootMatch[1]}/app.html`;
     }
     return normalized;
+  }
+
+  function findStructuredMediaPackageForPage(pageNum) {
+    if (!Number.isFinite(pageNum) || pageNum <= 0) {
+      return "";
+    }
+    const target = String(Math.round(pageNum));
+    const counts = new Map();
+    const collect = (value) => {
+      const lower = String(value || "").toLowerCase();
+      const match = lower.match(
+        /\/content\/media\/([^/]+)\/content\/pages\/page_(\d+)\/scale[1-4]\.(png|jpe?g|webp)$/
+      );
+      if (!match || match[2] !== target) {
+        return;
+      }
+      const pkg = match[1];
+      counts.set(pkg, (counts.get(pkg) || 0) + 1);
+    };
+    if (state.fileMapLower.size) {
+      for (const lowerKey of state.fileMapLower.keys()) {
+        collect(lowerKey);
+      }
+    }
+    if (!counts.size && state.fileEntries.length) {
+      state.fileEntries.forEach((entry) => {
+        collect(entry.lower || entry.path);
+      });
+    }
+    if (!counts.size) {
+      return "";
+    }
+    let best = "";
+    let bestCount = -1;
+    counts.forEach((count, pkg) => {
+      if (count > bestCount || (count === bestCount && pkg.localeCompare(best, "de") < 0)) {
+        best = pkg;
+        bestCount = count;
+      }
+    });
+    return best;
   }
 
   function decodePathSegment(value) {
@@ -9441,6 +9533,38 @@ function fitBookGridTitles() {
     const next = clamp(state.zoom + delta, 0.2, 4);
     state.zoom = next;
     applyZoom();
+  }
+
+  function normalizeWheelDeltaY(event) {
+    const raw = Number(event && event.deltaY);
+    if (!Number.isFinite(raw) || raw === 0) {
+      return 0;
+    }
+    if (event.deltaMode === 1) {
+      return raw * 16;
+    }
+    if (event.deltaMode === 2) {
+      const pageHeight = (els.viewer && els.viewer.clientHeight) || window.innerHeight || 800;
+      return raw * pageHeight;
+    }
+    return raw;
+  }
+
+  function getWheelZoomDelta(event) {
+    const normalized = normalizeWheelDeltaY(event);
+    if (!normalized) {
+      return 0;
+    }
+    const magnitude = Math.abs(normalized);
+    const isTrackpadLike = event.deltaMode === 0 && magnitude < 120;
+    if (isTrackpadLike || event.ctrlKey) {
+      const maxStep = event.shiftKey ? 0.04 : 0.025;
+      const step = clamp(magnitude * 0.00045, 0.0008, maxStep);
+      return normalized > 0 ? -step : step;
+    }
+    const maxStep = event.shiftKey ? 0.16 : 0.1;
+    const step = clamp(magnitude * 0.0014, 0.03, maxStep);
+    return normalized > 0 ? -step : step;
   }
 
   function getZoomAnchorElement(clientX, clientY) {
