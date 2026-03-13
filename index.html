@@ -1446,6 +1446,15 @@ body:not(.sidebar-open) .sidebar {
     /online\s*[-–—]?\s*diagnose/i,
     /(?:https?:\/\/)?(?:www\.)?[^/\s]+\/produkt\/isbn\//i,
   ];
+  const STRUCTURED_MATERIAL_SOURCE_PRIORITY = {
+    data: 300,
+    app: 200,
+    scan: 100,
+  };
+  const STRUCTURED_MATERIAL_TARGET_TYPE = {
+    local: "local",
+    external: "external",
+  };
   const state = {
     book: null,
     search: null,
@@ -7624,45 +7633,54 @@ function fitBookGridTitles() {
     loading.textContent = "Material wird geladen …";
     container.appendChild(loading);
 
-    Promise.all(pages.map((page) => loadMaterialsForPage(page)))
-      .then((groups) => {
+    const promise =
+      state.bookFormat === "structured"
+        ? loadStructuredMaterialsForPages(pages)
+        : Promise.all(pages.map((page) => loadMaterialsForPage(page))).then((groups) => {
+            const rawEntries = [];
+            groups.forEach((groupEntries) => {
+              if (Array.isArray(groupEntries) && groupEntries.length) {
+                rawEntries.push(...groupEntries);
+              }
+            });
+            return dedupeMaterialEntries(rawEntries);
+          });
+
+    promise
+      .then((entries) => {
         if (requestId !== state.materialRequestId) {
           return;
         }
-        try {
-          container.innerHTML = "";
-          let hasAny = false;
-
-          pages.forEach((page, index) => {
-            const rawEntries = Array.isArray(groups[index]) ? groups[index] : [];
-            const entries = dedupeMaterialEntries(rawEntries);
-            if (!entries.length) {
-              return;
-            }
-            hasAny = true;
-
-            const list = document.createElement("div");
-            list.className = "material-list";
-            const grouped = groupMaterials(entries);
-            grouped.forEach((group) => {
-              const node = createMaterialGroupItem(group);
-              if (node) {
-                list.appendChild(node);
-              }
-            });
-            container.appendChild(list);
-          });
-
-          if (!hasAny) {
-            container.textContent = "Keine Materialien für diese Seite.";
-          }
-        } catch (error) {
-          container.textContent = "Keine Materialien für diese Seite.";
-        }
+        renderMaterialPanelEntries(container, entries);
       })
       .catch(() => {
         container.textContent = "Keine Materialien für diese Seite.";
       });
+  }
+
+  function renderMaterialPanelEntries(container, entries) {
+    if (!container) {
+      return;
+    }
+    container.innerHTML = "";
+    if (!Array.isArray(entries) || !entries.length) {
+      container.textContent = "Keine Materialien für diese Seite.";
+      return;
+    }
+    const list = document.createElement("div");
+    list.className = "material-list";
+    const grouped = groupMaterials(entries);
+    grouped.forEach((group) => {
+      const node = createMaterialGroupItem(group);
+      if (node) {
+        list.appendChild(node);
+      }
+    });
+    if (!list.children.length) {
+      container.textContent = "Keine Materialien für diese Seite.";
+      return;
+    }
+    container.appendChild(list);
   }
 
   function groupMaterials(entries) {
@@ -7791,12 +7809,22 @@ function fitBookGridTitles() {
   }
 
   function parseMaterialPageFromPath(value) {
-    const raw = String(value || "");
+    const raw = String(value || "").trim();
     if (!raw) {
       return null;
     }
-    if (!/\.html?(?:[?#]|$)/i.test(raw)) {
-      return null;
+    const pageParam = parseLooseMaterialPageParam(raw);
+    if (Number.isFinite(pageParam)) {
+      return pageParam;
+    }
+    const pagePathMatch = raw.match(
+      /(?:^|\/)content\/(?:media\/[^/]+\/content\/)?pages\/page_(\d+)(?:\/|$)/i
+    );
+    if (pagePathMatch) {
+      const pageFromPath = parseInt(pagePathMatch[1], 10);
+      if (Number.isFinite(pageFromPath)) {
+        return pageFromPath;
+      }
     }
     const match = raw.match(/[?&#]page=(\d+)/i);
     if (!match) {
@@ -8143,28 +8171,138 @@ function fitBookGridTitles() {
     if (!normalized) {
       return "";
     }
+    if (/^[?#]/.test(normalized)) {
+      const pageOnly = parseLooseMaterialPageParam(normalized);
+      if (Number.isFinite(pageOnly)) {
+        return resolveStructuredBookPageTarget(pageOnly);
+      }
+    }
+    const mediaAppMatch = normalized.match(
+      /^content\/media\/([^/]+)\/app\.html(?:[?#].*)?$/i
+    );
+    if (mediaAppMatch) {
+      const pkg = mediaAppMatch[1];
+      const page = parseMaterialPageFromPath(normalized);
+      if (Number.isFinite(page)) {
+        const mappedPage = resolveStructuredMediaAppPageParam(pkg, page);
+        return resolveStructuredMediaPageTarget(pkg, mappedPage);
+      }
+      return resolveStructuredMediaRootTarget(pkg, "");
+    }
     const appRelativeMatch = normalized.match(/^app\.html([?#].*)?$/i);
     if (appRelativeMatch) {
       const page = parseMaterialPageFromPath(normalized);
       const pkg = findStructuredMediaPackageForPage(page);
       if (pkg) {
+        if (Number.isFinite(page)) {
+          const mappedPage = resolveStructuredMediaAppPageParam(pkg, page);
+          return resolveStructuredMediaPageTarget(pkg, mappedPage);
+        }
         const suffix = appRelativeMatch[1] || "";
-        return `content/media/${pkg}/app.html${suffix}`;
+        return resolveStructuredMediaRootTarget(pkg, suffix);
+      }
+      if (Number.isFinite(page)) {
+        return resolveStructuredBookPageTarget(page);
       }
     }
-    const pageMatch = normalized.match(
-      /^content\/media\/([^/]+)\/content\/pages\/page_(\d+)\//i
+    const pageDirMatch = normalized.match(
+      /^content\/media\/([^/]+)\/content\/pages\/page_(\d+)\/?(?:[?#].*)?$/i
     );
-    if (pageMatch) {
-      return `content/media/${pageMatch[1]}/app.html?page=${pageMatch[2]}`;
+    if (pageDirMatch) {
+      const pkg = pageDirMatch[1];
+      const page = parseInt(pageDirMatch[2], 10);
+      if (Number.isFinite(page)) {
+        return resolveStructuredMediaPageTarget(pkg, page);
+      }
+      return normalized;
     }
     const pagesRootMatch = normalized.match(
       /^content\/media\/([^/]+)\/content\/pages\/?$/i
     );
     if (pagesRootMatch) {
-      return `content/media/${pagesRootMatch[1]}/app.html`;
+      return resolveStructuredMediaRootTarget(pagesRootMatch[1], "");
     }
     return normalized;
+  }
+
+  function resolveStructuredMediaAppPageParam(pkg, pageNum) {
+    const page = Math.round(Number(pageNum));
+    if (!Number.isFinite(page) || page <= 0 || !pkg) {
+      return page;
+    }
+    // Materialpakete referenzieren app.html?page in der Regel 1-basiert,
+    // die Dateien liegen jedoch als page_0, page_1, ... vor.
+    const hasZeroPage = Boolean(resolveStructuredMediaPageImagePath(pkg, 0));
+    if (!hasZeroPage) {
+      return page;
+    }
+    return Math.max(0, page - 1);
+  }
+
+  function resolveStructuredMediaRootTarget(pkg, suffix = "") {
+    if (!pkg) {
+      return "";
+    }
+    const appPath = `content/media/${pkg}/app.html`;
+    if (hasFileAtPath(appPath, { allowMedia: true })) {
+      return `${appPath}${suffix || ""}`;
+    }
+    const firstPage = findFirstStructuredMediaPageForPackage(pkg);
+    if (Number.isFinite(firstPage)) {
+      return resolveStructuredMediaPageTarget(pkg, firstPage);
+    }
+    return `${appPath}${suffix || ""}`;
+  }
+
+  function resolveStructuredMediaPageTarget(pkg, pageNum) {
+    if (!pkg) {
+      return "";
+    }
+    const page = Math.round(Number(pageNum));
+    if (!Number.isFinite(page) || page < 0) {
+      return "";
+    }
+    const resolved = resolveStructuredMediaPageImagePath(pkg, page);
+    if (resolved) {
+      return resolved;
+    }
+    const bestEffort = getStructuredScaleCandidates()[0] || "Scale4.png";
+    return `content/media/${pkg}/content/pages/page_${page}/${bestEffort}`;
+  }
+
+  function findFirstStructuredMediaPageForPackage(pkg) {
+    if (!pkg) {
+      return null;
+    }
+    const targetPkg = String(pkg).toLowerCase();
+    let firstPage = null;
+    const collect = (value) => {
+      const lower = String(value || "").toLowerCase();
+      const match = lower.match(
+        /(?:^|\/)content\/media\/([^/]+)\/content\/pages\/page_(\d+)\/scale[1-4]\.(png|jpe?g|webp)$/
+      );
+      if (!match || match[1] !== targetPkg) {
+        return;
+      }
+      const page = parseInt(match[2], 10);
+      if (!Number.isFinite(page) || page <= 0) {
+        return;
+      }
+      if (!Number.isFinite(firstPage) || page < firstPage) {
+        firstPage = page;
+      }
+    };
+    if (state.fileMapLower.size) {
+      for (const lowerKey of state.fileMapLower.keys()) {
+        collect(lowerKey);
+      }
+    }
+    if (!Number.isFinite(firstPage) && state.fileEntries.length) {
+      state.fileEntries.forEach((entry) => {
+        collect(entry.lower || entry.path);
+      });
+    }
+    return Number.isFinite(firstPage) ? firstPage : null;
   }
 
   function findStructuredMediaPackageForPage(pageNum) {
@@ -8392,6 +8530,7 @@ function fitBookGridTitles() {
 
     const formats = document.createElement("div");
     formats.className = "material-formats";
+    const seenLinks = new Set();
     const sortedEntries = group.entries.slice().sort((a, b) => {
       const aKey = getMaterialSortKey(a);
       const bKey = getMaterialSortKey(b);
@@ -8410,6 +8549,11 @@ function fitBookGridTitles() {
       if (!url) {
         return;
       }
+      const linkKey = String(url).trim();
+      if (linkKey && seenLinks.has(linkKey)) {
+        return;
+      }
+      seenLinks.add(linkKey);
       hasAction = true;
       const link = document.createElement("a");
       link.className = "material-format";
@@ -8435,7 +8579,7 @@ function fitBookGridTitles() {
       return state.pageMediaCache.get(page);
     }
     if (state.bookFormat === "structured") {
-      const entries = await loadStructuredMaterialsForPage(page);
+      const entries = await loadStructuredMaterialsForPages([page]);
       state.pageMediaCache.set(page, entries);
       return entries;
     }
@@ -8447,6 +8591,426 @@ function fitBookGridTitles() {
     } catch (error) {
       return [];
     }
+  }
+
+  async function loadStructuredMaterialsForPages(pages) {
+    const visiblePages = normalizeStructuredVisiblePages(pages);
+    if (!visiblePages.length) {
+      return [];
+    }
+    const candidates = await collectStructuredMaterialCandidatesForPages(visiblePages);
+    const resolved = resolveStructuredMaterialCandidates(candidates);
+    return dedupeAndRankStructuredMaterials(resolved);
+  }
+
+  function normalizeStructuredVisiblePages(pages) {
+    if (!Array.isArray(pages)) {
+      return [];
+    }
+    const seen = new Set();
+    const result = [];
+    pages.forEach((value) => {
+      const page = Number(value);
+      if (!Number.isFinite(page) || page <= 0 || seen.has(page)) {
+        return;
+      }
+      seen.add(page);
+      result.push(page);
+    });
+    return result;
+  }
+
+  function getStructuredMaterialSourcePriority(source) {
+    return STRUCTURED_MATERIAL_SOURCE_PRIORITY[source] || 0;
+  }
+
+  function createStructuredMaterialCandidate(
+    source,
+    pageContext,
+    rawRef,
+    title,
+    subtitle,
+    extensionHint,
+    description
+  ) {
+    const normalizedRef = String(rawRef || "").trim();
+    if (!normalizedRef) {
+      return null;
+    }
+    return {
+      source,
+      sourcePriority: getStructuredMaterialSourcePriority(source),
+      rawRef: normalizedRef,
+      pageContext: Number.isFinite(Number(pageContext)) ? Number(pageContext) : null,
+      title: String(title || "").trim(),
+      subtitle: String(subtitle || "").trim(),
+      extensionHint: String(extensionHint || "").trim(),
+      description: String(description || "").trim(),
+    };
+  }
+
+  async function collectStructuredMaterialCandidatesForPages(pages) {
+    const candidates = [];
+    const visiblePages = normalizeStructuredVisiblePages(pages);
+    if (!visiblePages.length) {
+      return candidates;
+    }
+    const [data, appIndex, mediaIndex] = await Promise.all([
+      ensureStructuredIndexLoaded(),
+      ensureStructuredAppMaterialsIndex(),
+      ensureStructuredMaterialsIndex(),
+    ]);
+    const lookup = getStructuredMaterialLookup(data);
+
+    visiblePages.forEach((page) => {
+      const pageData = getStructuredIndexPageDataForFilePage(data, page);
+      const indexEntries = extractStructuredMaterialsFromIndexPage(pageData, lookup);
+      indexEntries.forEach((entry) => {
+        const candidate = createStructuredMaterialCandidate(
+          "data",
+          page,
+          entry.rawRef || entry.url || entry.path || entry.file || "",
+          entry.name,
+          entry.label,
+          entry.extension,
+          entry.description
+        );
+        if (candidate) {
+          candidates.push(candidate);
+        }
+      });
+
+      if (appIndex && appIndex.size) {
+        const appEntries = appIndex.get(page) || [];
+        appEntries.forEach((entry) => {
+          const candidate = createStructuredMaterialCandidate(
+            "app",
+            page,
+            entry.rawRef || entry.url || entry.path || entry.file || "",
+            entry.name,
+            entry.label,
+            entry.extension,
+            entry.description
+          );
+          if (candidate) {
+            candidates.push(candidate);
+          }
+        });
+      }
+
+      if (mediaIndex) {
+        const scanEntries = buildStructuredScanEntriesForPage(mediaIndex, page);
+        scanEntries.forEach((entry) => {
+          const candidate = createStructuredMaterialCandidate(
+            "scan",
+            page,
+            entry.rawRef || entry.path || entry.url || "",
+            entry.name,
+            entry.label,
+            entry.extension,
+            entry.description
+          );
+          if (candidate) {
+            candidates.push(candidate);
+          }
+        });
+      }
+    });
+    return candidates;
+  }
+
+  function getStructuredIndexPageDataForFilePage(data, page) {
+    if (!data || !Array.isArray(data.pages)) {
+      return null;
+    }
+    if (state.structuredIndexByOriginal) {
+      const mapped = state.structuredIndexByOriginal.get(Number(page));
+      if (mapped) {
+        return mapped;
+      }
+    }
+    const index = Number(page) - Number(state.pageBase || 0);
+    if (!Number.isFinite(index) || index < 0 || index >= data.pages.length) {
+      return null;
+    }
+    return data.pages[index] || null;
+  }
+
+  function buildStructuredScanEntriesForPage(index, pageNum) {
+    const entries = [];
+    if (!index) {
+      return entries;
+    }
+    index.pagePackages.forEach((pkg) => {
+      const relPath = resolveStructuredMediaPageImagePath(pkg, pageNum);
+      if (!relPath) {
+        return;
+      }
+      const title =
+        (index.packageTitles && index.packageTitles.get(pkg)) ||
+        formatStructuredPackageName(pkg);
+      entries.push({
+        rawRef: relPath,
+        path: relPath,
+        name: title,
+        label: "",
+      });
+    });
+
+    index.kvRanges.forEach((range) => {
+      if (pageNum < range.start || pageNum > range.end) {
+        return;
+      }
+      entries.push({
+        rawRef: range.path,
+        path: range.path,
+        name: range.title,
+        label: "",
+      });
+    });
+    return entries;
+  }
+
+  function resolveStructuredMaterialCandidates(candidates) {
+    if (!Array.isArray(candidates) || !candidates.length) {
+      return [];
+    }
+    const resolved = [];
+    candidates.forEach((candidate) => {
+      const entry = resolveStructuredMaterialCandidate(candidate);
+      if (!entry) {
+        return;
+      }
+      if (shouldHideStructuredResolvedMaterial(entry)) {
+        return;
+      }
+      resolved.push(entry);
+    });
+    return resolved;
+  }
+
+  function resolveStructuredMaterialCandidate(candidate) {
+    if (!candidate || typeof candidate !== "object") {
+      return null;
+    }
+    const rawRef = String(candidate.rawRef || "").trim();
+    if (!rawRef) {
+      return null;
+    }
+    let targetType = STRUCTURED_MATERIAL_TARGET_TYPE.local;
+    let resolvedRef = "";
+    if (
+      REGEX.httpProtocol.test(rawRef) ||
+      rawRef.startsWith("//") ||
+      (/^mailto:/i.test(rawRef) && !/^[a-z]:[\\/]/i.test(rawRef))
+    ) {
+      targetType = STRUCTURED_MATERIAL_TARGET_TYPE.external;
+      resolvedRef = rawRef;
+    } else {
+      const resolvedLocal = resolveStructuredCandidateLocalReference(rawRef);
+      if (!resolvedLocal) {
+        return null;
+      }
+      targetType = STRUCTURED_MATERIAL_TARGET_TYPE.local;
+      resolvedRef = resolvedLocal;
+    }
+    const pageHint = parseMaterialPageFromPath(resolvedRef);
+    const extensionHint = String(candidate.extensionHint || "").trim();
+    const canonicalRef =
+      targetType === STRUCTURED_MATERIAL_TARGET_TYPE.local
+        ? normalizeFilePath(resolvedRef).toLowerCase()
+        : String(resolvedRef).trim().toLowerCase();
+    if (!canonicalRef) {
+      return null;
+    }
+    return {
+      url: targetType === STRUCTURED_MATERIAL_TARGET_TYPE.external ? resolvedRef : "",
+      path: targetType === STRUCTURED_MATERIAL_TARGET_TYPE.local ? resolvedRef : "",
+      name: String(candidate.title || "").trim() || resolvedRef.split("/").pop() || resolvedRef,
+      label: String(candidate.subtitle || "").trim(),
+      description: String(candidate.description || "").trim(),
+      extension: extensionHint,
+      page: Number.isFinite(pageHint) ? pageHint : null,
+      source: candidate.source || "",
+      sourcePriority: Number(candidate.sourcePriority) || 0,
+      pageContext:
+        Number.isFinite(Number(candidate.pageContext)) ? Number(candidate.pageContext) : null,
+      rawRef,
+      targetType,
+      resolvedRef,
+      canonicalKey: `${targetType}|${canonicalRef}`,
+    };
+  }
+
+  function resolveStructuredCandidateLocalReference(rawRef) {
+    const raw = String(rawRef || "").trim();
+    if (!raw) {
+      return "";
+    }
+    if (/^[?#]/.test(raw)) {
+      const pageOnly = parseLooseMaterialPageParam(raw);
+      if (Number.isFinite(pageOnly)) {
+        return resolveStructuredBookPageTarget(pageOnly);
+      }
+    }
+    const normalized = normalizeStructuredMaterialPath(raw) || normalizeFilePath(raw);
+    if (!normalized) {
+      return "";
+    }
+    if (/^content\/pages\/page_\d+\/?$/i.test(normalized)) {
+      const match = normalized.match(/page_(\d+)/i);
+      const page = match ? parseInt(match[1], 10) : NaN;
+      if (Number.isFinite(page)) {
+        return resolveStructuredBookPageTarget(page);
+      }
+    }
+    if (/^content\/pages\/page_\d+\/scale[1-4]\.(png|jpe?g|webp)$/i.test(normalized)) {
+      return normalized;
+    }
+    return resolveStructuredMaterialLink(normalized);
+  }
+
+  function resolveStructuredBookPageTarget(pageNum) {
+    const page = Math.round(Number(pageNum));
+    if (!Number.isFinite(page) || page <= 0) {
+      return "";
+    }
+    const base = `content/pages/page_${page}/`;
+    for (const scale of getStructuredScaleCandidates()) {
+      const relPath = `${base}${scale}`;
+      if (hasFileAtPath(relPath, { allowMedia: true })) {
+        return relPath;
+      }
+    }
+    const bestEffort = getStructuredScaleCandidates()[0] || "Scale4.png";
+    return `${base}${bestEffort}`;
+  }
+
+  function shouldHideStructuredResolvedMaterial(entry) {
+    if (!entry || typeof entry !== "object") {
+      return true;
+    }
+    const resolvedRef = String(entry.resolvedRef || entry.path || entry.url || "").trim();
+    if (!resolvedRef) {
+      return true;
+    }
+    if (entry.targetType === STRUCTURED_MATERIAL_TARGET_TYPE.external) {
+      if (/^mailto:/i.test(resolvedRef)) {
+        return true;
+      }
+      const haystack = [entry.name, entry.label, entry.description, resolvedRef]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+        .join(" ");
+      return HIDDEN_MATERIAL_PATTERNS.some((pattern) => pattern.test(haystack));
+    }
+
+    const localRef = normalizeLocalMaterialReference(resolvedRef);
+    if (!localRef || !hasLocalMaterialTarget(localRef)) {
+      return true;
+    }
+
+    if (isStructuredCurrentBookPageReference(entry)) {
+      return true;
+    }
+
+    const haystack = [entry.name, entry.label, entry.description, localRef]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+      .join(" ");
+    return HIDDEN_MATERIAL_PATTERNS.some((pattern) => pattern.test(haystack));
+  }
+
+  function isStructuredCurrentBookPageReference(entry) {
+    if (!entry || entry.targetType !== STRUCTURED_MATERIAL_TARGET_TYPE.local) {
+      return false;
+    }
+    if (!Number.isFinite(entry.pageContext)) {
+      return false;
+    }
+    const localRef = normalizeLocalMaterialReference(entry.resolvedRef || entry.path || "");
+    if (!localRef) {
+      return false;
+    }
+    const match = localRef.match(
+      /^content\/pages\/page_(\d+)\/scale[1-4]\.(png|jpe?g|webp)$/i
+    );
+    if (!match) {
+      return false;
+    }
+    const targetPage = parseInt(match[1], 10);
+    if (!Number.isFinite(targetPage)) {
+      return false;
+    }
+    return targetPage === Number(entry.pageContext);
+  }
+
+  function getStructuredMaterialMetadataScore(entry) {
+    if (!entry || typeof entry !== "object") {
+      return 0;
+    }
+    let score = 0;
+    const name = String(entry.name || "").trim();
+    const label = String(entry.label || "").trim();
+    const description = String(entry.description || "").trim();
+    const ext = String(entry.extension || "").trim();
+    if (name && name.length > 1) {
+      score += 2;
+    }
+    if (label) {
+      score += 1;
+    }
+    if (description) {
+      score += 1;
+    }
+    if (ext) {
+      score += 1;
+    }
+    return score;
+  }
+
+  function dedupeAndRankStructuredMaterials(entries) {
+    if (!Array.isArray(entries) || !entries.length) {
+      return [];
+    }
+    const bestByKey = new Map();
+    entries.forEach((entry) => {
+      if (!entry || !entry.canonicalKey) {
+        return;
+      }
+      const existing = bestByKey.get(entry.canonicalKey);
+      if (!existing) {
+        bestByKey.set(entry.canonicalKey, entry);
+        return;
+      }
+      const aPriority = Number(entry.sourcePriority) || 0;
+      const bPriority = Number(existing.sourcePriority) || 0;
+      if (aPriority !== bPriority) {
+        if (aPriority > bPriority) {
+          bestByKey.set(entry.canonicalKey, entry);
+        }
+        return;
+      }
+      const aScore = getStructuredMaterialMetadataScore(entry);
+      const bScore = getStructuredMaterialMetadataScore(existing);
+      if (aScore > bScore) {
+        bestByKey.set(entry.canonicalKey, entry);
+      }
+    });
+    return Array.from(bestByKey.values());
+  }
+
+  function parseLooseMaterialPageParam(value) {
+    const raw = String(value || "").trim();
+    if (!raw) {
+      return null;
+    }
+    const match = raw.match(/(?:^|[?&#])page=(\d+)/i);
+    if (!match) {
+      return null;
+    }
+    const page = parseInt(match[1], 10);
+    return Number.isFinite(page) ? page : null;
   }
 
   function loadPageData(page) {
@@ -8732,8 +9296,12 @@ function fitBookGridTitles() {
       if (!src) {
         return;
       }
-      const isRemote = /^https?:/i.test(src);
+      const isRemote =
+        REGEX.httpProtocol.test(src) ||
+        src.startsWith("//") ||
+        (hasNonFileUrlScheme(src) && !REGEX.fileProtocol.test(src));
       entries.push({
+        rawRef: src,
         url: isRemote ? src : "",
         path: isRemote ? "" : normalizeStructuredMaterialPath(src),
         name:
@@ -8844,15 +9412,20 @@ function fitBookGridTitles() {
         const entries = [];
         anchors.forEach((anchor) => {
           const href = String(anchor.getAttribute("href") || "").trim();
-          if (!href || href.startsWith("?page=") || href.startsWith("#page=")) {
+          if (!href) {
             return;
           }
-          const isRemote = /^https?:/i.test(href);
+          const isRemote =
+            REGEX.httpProtocol.test(href) ||
+            href.startsWith("//") ||
+            (hasNonFileUrlScheme(href) && !REGEX.fileProtocol.test(href));
           const label = getAppHtmlMaterialLabel(anchor);
+          const anchorText = String(anchor.textContent || "").trim();
           const entry = {
+            rawRef: href,
             url: isRemote ? href : "",
             path: isRemote ? "" : normalizeStructuredMaterialPath(href),
-            name: label || href.split("/").pop() || href,
+            name: label || anchorText || href.split("/").pop() || href,
             label: "",
             extension: anchor.getAttribute("data-file-type") || (isRemote ? "LINK" : ""),
           };
@@ -8930,11 +9503,10 @@ function fitBookGridTitles() {
       if (!keyBase) {
         return;
       }
-      const extKey = String(entry.extension || "").toLowerCase();
       const pageHint = getMaterialPageHint(entry);
       if (Number.isFinite(pageHint)) {
         const normalizedBase = normalizeMaterialKey(keyBase);
-        const baseKey = `${normalizedBase}|${extKey}`;
+        const baseKey = normalizedBase || keyBase;
         const seenPages = seenPagesByBase.get(baseKey) || [];
         if (seenPages.some((page) => Math.abs(page - pageHint) <= 1)) {
           return;
@@ -8942,7 +9514,7 @@ function fitBookGridTitles() {
         seenPages.push(pageHint);
         seenPagesByBase.set(baseKey, seenPages);
       }
-      const key = `${keyBase}|${extKey}`;
+      const key = keyBase;
       if (seen.has(key)) {
         return;
       }
@@ -8955,6 +9527,9 @@ function fitBookGridTitles() {
   function shouldHideMaterialEntry(entry) {
     if (!entry || typeof entry !== "object") {
       return false;
+    }
+    if (isStructuredBookPageMaterialEntry(entry)) {
+      return true;
     }
     const textParts = [
       entry.name,
@@ -8972,6 +9547,27 @@ function fitBookGridTitles() {
       return false;
     }
     return HIDDEN_MATERIAL_PATTERNS.some((pattern) => pattern.test(haystack));
+  }
+
+  function isStructuredBookPageMaterialEntry(entry) {
+    if (state.bookFormat !== "structured" || !entry || typeof entry !== "object") {
+      return false;
+    }
+    const refs = [entry.path, entry.file, entry.url];
+    for (const ref of refs) {
+      const normalized = normalizeLocalMaterialReference(ref);
+      if (!normalized) {
+        continue;
+      }
+      const lower = normalized.toLowerCase();
+      if (!lower.startsWith("content/pages/page_")) {
+        continue;
+      }
+      if (isStructuredScaleImagePath(lower)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async function loadStructuredIndexMaterialsForPage(page) {
@@ -8998,57 +9594,11 @@ function fitBookGridTitles() {
   }
 
   async function loadStructuredMaterialsForPage(page) {
-    const entries = [];
-    const indexEntries = await loadStructuredIndexMaterialsForPage(page);
-    if (indexEntries.length) {
-      entries.push(...indexEntries);
+    const pageNum = Number(page);
+    if (!Number.isFinite(pageNum)) {
+      return [];
     }
-    if (!entries.length) {
-      const appIndex = await ensureStructuredAppMaterialsIndex();
-      if (appIndex && appIndex.size) {
-        const pageNum = Number(page);
-        if (Number.isFinite(pageNum) && appIndex.has(pageNum)) {
-          entries.push(...(appIndex.get(pageNum) || []));
-        }
-      }
-    }
-
-    if (!entries.length) {
-      const index = await ensureStructuredMaterialsIndex();
-      if (!index) {
-        return [];
-      }
-      const pageNum = Number(page);
-      index.pagePackages.forEach((pkg) => {
-        const relPath = resolveStructuredMediaPageImagePath(pkg, pageNum);
-        if (!relPath) {
-          return;
-        }
-        const title =
-          (index.packageTitles && index.packageTitles.get(pkg)) || formatStructuredPackageName(pkg);
-        entries.push({
-          path: relPath,
-          name: title,
-          label: "",
-        });
-      });
-
-      index.kvRanges.forEach((range) => {
-        if (pageNum < range.start || pageNum > range.end) {
-          return;
-        }
-        if (!hasFileAtPath(range.path, { allowMedia: true })) {
-          return;
-        }
-        entries.push({
-          path: range.path,
-          name: range.title,
-          label: "",
-        });
-      });
-    }
-
-    return dedupeMaterialEntries(entries);
+    return loadStructuredMaterialsForPages([pageNum]);
   }
 
   function resolveStructuredMediaPageImagePath(pkg, pageNum) {
