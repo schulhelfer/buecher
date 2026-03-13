@@ -2100,6 +2100,9 @@ body:not(.sidebar-open) .sidebar {
   }
 
   async function loadLegacyData(loadId) {
+    if (!hasFileAtPath("book.json")) {
+      return null;
+    }
     const book = await fetchJson(resolvePath("book.json")).catch(() => null);
     if (!book) {
       return null;
@@ -6318,11 +6321,26 @@ function fitBookGridTitles() {
     if (state.fileMap.size) {
       const url = getObjectUrlForPath(base, options);
       if (url) {
-        return `${url}${suffix}`;
+        return appendResourceSuffix(url, suffix);
       }
       return "";
     }
     return resolved;
+  }
+
+  function appendResourceSuffix(url, suffix) {
+    if (!suffix) {
+      return url;
+    }
+    if (!url || !/^blob:/i.test(String(url))) {
+      return `${url}${suffix}`;
+    }
+    const raw = String(suffix);
+    if (raw.startsWith("?")) {
+      const hash = raw.slice(1);
+      return hash ? `${url}#${hash}` : url;
+    }
+    return `${url}${raw}`;
   }
 
   function updateCopyAvailability(pages) {
